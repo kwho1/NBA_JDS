@@ -1,0 +1,398 @@
+```{r}
+library(rTensor)
+library(einsum)
+library(stats)
+library(qlcMatrix)
+library(pracma)
+library(arm)
+library(CHNOSZ)
+library(parallel)
+library(dTBM)
+library(torch)
+library(Matrix)
+library(truncnorm)
+library(gridExtra)
+
+options(warn=-1)
+
+## Input the tensor counts and per shot data from the output of "Data Preparation.rmd"
+y=mytensor.Y
+x=data.shot
+dim(y)
+prod(dim(y)) #number of elements
+prod(dim(y))-sum(y==0) #number of non-zero elements
+
+## Below are functions to be used in the main algorithm
+
+## matricization of a 3-mode tensor
+unfold3d <- function(input){
+  dim1=input[[1]]; dim2=input[[2]]; dim3=input[[3]]; ordering=input[[4]]; y=input[[5]]
+  out=array(,dim=c(dim1,(dim2*dim3)))
+  tempy=aperm(y,ordering) 
+  count=0;
+  for(j in 1:dim3){
+    out[,(count*dim2+1):((count+1)*dim2)]=tempy[,,j]
+    count=count+1
+  }
+  out
+}
+
+## fold back a matricized 3-mode tensor into a tensor
+fold3d <- function(input){
+  I1=input[[1]]; I2=input[[2]]; I3=input[[3]]; z.1=input[[4]];
+  z=array(, dim=c(I1,I2,I3))
+  temp2=as.array(z.1)
+  for(j in 1:I3){
+      z[,,j]=temp2[,((j-1)*I2+1):(j*I2)]
+  }
+  z
+}
+
+## to update the latent variables of a given mode (dim1) for a 3-mode tensor
+updateA <- function(input){
+  dim1=input[[1]]; dim2=input[[2]]; dim3=input[[3]]; s.ek=input[[4]]; a.e.dim1=input[[5]]; a.e.dim2=input[[6]]; a.e.dim3=input[[7]]; a.esq.dim1=input[[8]]; a.esq.dim2=input[[9]]; a.esq.dim3=input[[10]]; phi.ek=input[[11]]; tau.phi=input[[12]]; Y.e=input[[13]]; r.e=input[[14]]; w.ek=input[[15]]
+  
+  D=ncol(a.e.dim1)
+  temp2=a.e.dim1%*%t(KhatriRao(a.e.dim3,a.e.dim2))
+  temp.s=matrix(rep(s.ek ,dim1),nrow=dim1,byrow=T)
+  temp1=matrix(rep(1,(dim1*D)), nrow=dim1, ncol=D)
+  temp4=t(KhatriRao(a.esq.dim3,a.esq.dim2))
+  temp5=t(KhatriRao(a.e.dim3,a.e.dim2))
+  ones=matrix(rep(1,(dim2*dim3)),ncol=1)
+  a.muk=matrix(,nrow=dim1,ncol=D)
+  a.preck=matrix(,nrow=dim1,ncol=D)
+  a.ek=matrix(,nrow=dim1,ncol=D)
+  a.esqk=matrix(,nrow=dim1,ncol=D)
+  
+  for(d in 1:D){
+    EK2sq = temp1[,d]%*%matrix(temp4[d,],nrow=1)
+    EK2 = temp1[,d]%*%matrix(temp5[d,],nrow=1)
+    EK1 = temp2-a.e.dim1[,d]%*%matrix(temp5[d,],nrow=1)
+    temp.prec=as.vector(temp.s[,d])+((w.ek+tau.phi)*EK2sq)%*%ones
+    a.preck[,d]=temp.prec
+    temp.mu= (matrix(((Y.e-r.e)/2*EK2-w.ek*(EK1)*EK2+tau.phi*(phi.ek-EK1)*EK2)%*%ones, ncol=1))/temp.prec    
+    a.muk[,d]=temp.mu
+    for(i in 1:dim1){
+      test=temp.mu[i]*sqrt(temp.prec[i])
+      if(is.na(test)==TRUE){
+        a.ek[i,d]=a.muk[i,d]
+        a.esqk[i,d]=(a.preck[i,d])^(-1)+a.ek[i,d]^2
+      }else if(test>-7){
+        a.ek[i,d]=etruncnorm(a=0, b=Inf, mean=temp.mu[i], sd=1/sqrt(temp.prec[i]))
+        a.esqk[i,d]=vtruncnorm(a=0, b=Inf, mean=temp.mu[i], sd=1/sqrt(temp.prec[i]))+(a.ek[i,d])^2
+      }else{
+        a.ek[i,d]=etruncnorm(a=0, b=Inf, mean=temp.mu[i], sd=1/sqrt(temp.prec[i]))
+        a.esqk[i,d]=(1/temp.prec[i])/(test^2-1)+(a.ek[i,d])^2
+      }
+    }
+  }
+  list(a.muk, a.preck, a.ek, a.esqk)
+}
+
+
+## Main Variational EM (VEM) algorithm
+
+I1=dim(y)[1]; I2=dim(y)[2]; I3=dim(y)[3]
+
+
+## Matricization of the 3-mode count tensor with different modes as the row variable
+y.1=unfold3d(list(I1, I2, I3, c(1,2,3), mytensor.Y))
+y.2=unfold3d(list(I2, I1, I3, c(2,1,3), mytensor.Y))
+y.3=unfold3d(list(I3, I1, I2, c(3,1,2), mytensor.Y))
+
+result=list()
+
+set.seed(1)
+for(runs in 1:20){ # run 20 times with different random initial values and choose the highest ELBO, it is essential to run multiple runs for selection because initial values generally affect performance of variational bayes algorithms.
+  it.num=1000 # number of iterations for each run of the VEM algorithm
+
+  # parameter values
+
+  D=15 # max number of factors for tensor decomposition
+  K=3 #  number of modes of the tensor
+  p=4 # number of covariates for the logistic regression part
+  eps1=10^(-6) #hyperparameter for s
+  eps2=10^(-6) # hyperparameter for s
+  omega.beta=10^(-6)*diag(rep(1,p)) # hyperparamter for beta vector
+  tau.xi=10^(-6) # hyperparameter for xi
+  tau.phi.eps = 10^(-2)  
+
+  ## define the arrays to be used
+  a.alpha1=matrix(, nrow=I1, ncol=D)
+  a.beta1=matrix(, nrow=I1, ncol=D)
+  a.e1=matrix(, nrow=I1, ncol=D) # I1*D matrix storing the E(a_{i_1}d^(1)) for the 1-th mode 
+  a.esq1=matrix(, nrow=I1, ncol=D) # I1*D matrix storing the E( a_{i_1}d^(1) ^2) for the 1-th mode 
+  a.alpha2=matrix(, nrow=I2, ncol=D)
+  a.beta2=matrix(, nrow=I2, ncol=D)
+  a.e2=matrix(, nrow=I2, ncol=D)   
+  a.esq2=matrix(, nrow=I2, ncol=D) 
+  a.alpha3=matrix(, nrow=I3, ncol=D)
+  a.beta3=matrix(, nrow=I3, ncol=D)
+  a.e3=matrix(, nrow=I3, ncol=D) 
+  a.esq3=matrix(, nrow=I3, ncol=D) 
+  s.a=s.b=s.e=array(,dim=D)
+
+  # initialization
+  
+  r.e=5
+  
+  
+for(i in 1:I1){
+  for(d in 1:D){
+    a.e1[i,d]= runif(1,1,10) 
+    a.esq1[i,d]=a.e1[i,d]^2+10*runif(1,0,1) 
+  }
+}
+for(i in 1:I2){
+  for(d in 1:D){
+    a.e2[i,d]=runif(1,1,10) 
+    a.esq2[i,d]=a.e2[i,d]^2+10*runif(1,0,1) 
+  }
+}
+for(i in 1:I3){
+  for(d in 1:D){
+    a.e3[i,d]=runif(1,1,10) 
+    a.esq3[i,d]=a.e3[i,d]^2+10*runif(1,0,1) 
+  }
+}
+
+
+for(i in 1:D){
+  s.e[i]=runif(1,10,100)
+}
+
+for(i in 1:p){
+  beta.e=rep(0,p)
+  beta.esq=diag(rep(1,p)) # E(beta beta^T)
+}
+
+xi.e=runif(1,5,10)
+xi.esq=xi.e^2 +2*runif(1,0,1)
+
+phi.e1=matrix(runif((I1*I2*I3),-10,10), nrow=I1)
+phi.esq1 = phi.e1*phi.e1 + matrix(runif((I1*I2*I3),0,2), nrow=I1)
+phi.e=fold3d(list(I1,I2,I3,phi.e1))
+phi.e2=unfold3d(list(I2,I1,I3,c(2,1,3),phi.e))
+phi.e3=unfold3d(list(I3,I1,I2,c(3,1,2),phi.e))
+
+v.ce=matrix(,nrow=nrow(x),ncol=5)
+v.ce[,1:3]=x[,1:3] # i1, i2, i3
+
+out=0
+made.sum1=matrix(rep(0,(I1*I2*I3)),nrow=I1)
+for(dim1 in 1:I1){
+  for(dim2 in 1:(I2*I3)){
+    num=y.1[dim1,dim2]
+    if(num>0){
+      made.sum1[dim1,dim2]=made.sum1[dim1,dim2]+sum(x[(out+1):(out+num),4])
+    }
+    out=out+num
+  }
+}
+
+out=0
+temp.sum=matrix(rep(0,p),nrow=1)
+for(dim1 in 1:I1){
+  for(dim2 in 1:(I2*I3)){
+    num=y.1[dim1,dim2]
+    if(num>0){
+      temp.sum=temp.sum+t(rep(1,num))%*%((x[(out+1):(out+num),4]-0.5)*x[(out+1):(out+num),5:(4+p)])
+    }
+    out=out+num
+  }
+} # a row vector for updating beta
+
+#VB updating
+
+ELBO=NULL
+
+  for(ncal in 1:it.num){
+
+    temp1=a.esq1%*%t(KhatriRao(a.esq3,a.esq2))
+    temp2=a.e1%*%t(KhatriRao(a.e3,a.e2))
+    temp3=(a.e1^2)%*%t(KhatriRao((a.e3^2),(a.e2^2)))
+
+    # update tau.phi
+  
+    tau.phi.a= tau.phi.eps+ (I1*I2*I3)/2
+    tau.phi.b= tau.phi.eps+ 0.5*(sum(phi.esq1)-2*sum(phi.e1*temp2)+sum(temp1+temp2^2-temp3))
+    tau.phi.e= tau.phi.a/tau.phi.b
+  
+    # update w
+
+    w.c1=sqrt(temp1+temp2^2-temp3) # gives the c parameter of W_i in mode-1 matricized form
+    w.e1=as.matrix(((y.1+r.e)/w.c1/2)*tanh(w.c1/2))
+  
+    #fold back from w.e1 to w.e and then unfold to w.e2, w.e3, w.e4
+  
+    w.e=fold3d(list(I1,I2,I3,w.e1))
+    w.e2=unfold3d(list(I2,I1,I3,c(2,1,3),w.e))
+    w.e3=unfold3d(list(I3,I1,I2,c(3,1,2),w.e))
+
+    #update a.mu, a.prec, a.e, a.esq 
+
+    out=updateA(list(I1,I2,I3,s.e,a.e1,a.e2,a.e3,a.esq1,a.esq2,a.esq3,phi.e1,  tau.phi.e, y.1, r.e, w.e1))
+    a.mu1=out[[1]]; a.prec1=out[[2]]; a.e1=out[[3]]; a.esq1=out[[4]]
+
+    out=updateA(list(I2,I1,I3,s.e,a.e2,a.e1,a.e3,a.esq2,a.esq1,a.esq3,phi.e2,  tau.phi.e, y.2, r.e, w.e2))
+    a.mu2=out[[1]]; a.prec2=out[[2]]; a.e2=out[[3]]; a.esq2=out[[4]]
+  
+    out=updateA(list(I3,I1,I2,s.e,a.e3,a.e1,a.e2,a.esq3,a.esq1,a.esq2,phi.e3,  tau.phi.e, y.3, r.e, w.e3))
+    a.mu3=out[[1]]; a.prec3=out[[2]]; a.e3=out[[3]]; a.esq3=out[[4]]
+
+    temp1=a.esq1%*%t(KhatriRao(a.esq3,a.esq2))
+    temp2=a.e1%*%t(KhatriRao(a.e3,a.e2))
+    temp3=(a.e1^2)%*%t(KhatriRao((a.e3^2),(a.e2^2)))
+  
+    ## update s.a, s.b, s.e
+
+    for(d in 1:D){
+      s.a[d]=(I1+I2+I3)/2+eps1
+      s.b[d]=eps2+0.5*(sum(a.esq1[,d])+sum(a.esq2[,d])+sum(a.esq3[,d]))
+    }
+    s.e=s.a/s.b
+
+    # update v
+  
+    beta.z = matrix(x[,5:(4+p)],nrow=nrow(x), ncol=p)%*%beta.e
+    temp.half=chol(beta.esq)%*%t(matrix(x[,5:(4+p)],nrow=nrow(x), ncol=p))
+    z.betasqr.z=t(matrix(rep(1,p),nrow=1)%*%(temp.half*temp.half))
+  
+    phi.e1.temp=rep(phi.e1,y.1)
+    phi.esq1.temp=rep(phi.esq1,y.1)
+  
+    v.ce[,4] = sqrt(xi.esq*phi.esq1.temp+2*xi.e*phi.e1.temp*beta.z+z.betasqr.z) # v.c
+    v.ce[,5] = 1/2/v.ce[,4]*tanh(v.ce[,4]/2) # v.e
+
+    # update phi.e, phi.esq
+  
+    out=0
+    ve.sum1=matrix(rep(0,(I1*I2*I3)),nrow=I1)
+    ve.betaz.sum1=matrix(rep(0,(I1*I2*I3)),nrow=I1)
+    ve.zz.sum=matrix(rep(0,(p*p)),nrow=p) # as a part for update beta
+    for(dim1 in 1:I1){
+      for(dim2 in 1:(I2*I3)){
+        num=y.1[dim1,dim2]
+        if(num>0){
+          ve.sum1[dim1,dim2]=ve.sum1[dim1,dim2]+sum(v.ce[(out+1):(out+num),5])
+          ve.betaz.sum1[dim1,dim2]=ve.betaz.sum1[dim1,dim2]+sum(v.ce[(out+1):(out+num),5]*beta.z[(out+1):(out+num)])
+          ve.zz.sum=ve.zz.sum+t(matrix(x[(out+1):(out+num),5:(4+p)],nrow=num,ncol=p)*as.vector(v.ce[(out+1):(out+num),5]))%*%matrix(x[(out+1):(out+num),5:(4+p)],nrow=num,ncol=p)
+        }
+        out=out+num
+      }
+    }
+  
+    phi.prec1 = tau.phi.e+ ve.sum1*xi.esq
+    numerator = tau.phi.e*(temp2)+(made.sum1-0.5*y.1)*xi.e-xi.e*ve.betaz.sum1
+    phi.e1 = numerator/phi.prec1
+    phi.esq1 = 1/phi.prec1 + phi.e1*phi.e1
+  
+    phi.e=fold3d(list(I1,I2,I3,phi.e1))
+    phi.e2=unfold3d(list(I2,I1,I3,c(2,1,3),phi.e))
+    phi.e3=unfold3d(list(I3,I1,I2,c(3,1,2),phi.e))
+ 
+  ## update beta.e, beta.esq
+  
+    out=0
+    ve.z.phi.sum=matrix(rep(0,p),nrow=1) # as a part for update beta
+    for(dim1 in 1:I1){
+    for(dim2 in 1:(I2*I3)){
+        num=y.1[dim1,dim2]
+        if(num>0){
+          ve.z.phi.sum=ve.z.phi.sum+ phi.e1[dim1,dim2]*matrix(rep(1,num),nrow=1)%*%(matrix(x[(out+1):(out+num),5:(4+p)],nrow=num,ncol=p)*as.vector(v.ce[(out+1):(out+num),5]))
+        }
+        out=out+num
+      }
+    }
+  
+    beta.prec = omega.beta + ve.zz.sum
+    numerator = t(temp.sum -xi.e*ve.z.phi.sum)
+    beta.cov=inv(beta.prec)
+    beta.e = beta.cov%*%numerator
+    beta.esq = beta.cov + beta.e%*%t(beta.e)
+   
+    ## update xi.e, xi.esq
+  
+    xi.prec =tau.xi+ sum(phi.esq1*ve.sum1)
+    xi.e= sum(phi.e1*(made.sum1-0.5*y.1-ve.betaz.sum1))/xi.prec
+    xi.esq=1/xi.prec+xi.e*xi.e
+  
+    ## update r.e
+    I=I1*I2*I3
+    lcosh=sum(log(cosh(w.c1/2)))
+    temp2.sum=sum(temp2)
+    const=w.c1*((cosh(w.c1/2)*tanh(w.c1/2))^2)/(sinh(w.c1)-w.c1)
+    const2=sum(const*digamma(const*(y.1+r.e)))
+    
+    r.old=r.e
+    
+    if(ncal>2){
+      obj.r <- function(r){
+        sum(lgamma(y.1+r))-I*lgamma(r) - (log(2)*I+1/2*temp2.sum+lcosh - const2)*r - sum(lgamma(const*(y.1+r)))
+      }
+      out=optimize(obj.r, lower=0.1, upper=10, maximum=T)
+      r.e=out$maximum
+    }
+    
+   ## update ELBO value
+    
+    phi.e1.temp=rep(phi.e1,y.1)
+    phi.esq1.temp=rep(phi.esq1,y.1)
+    beta.z = matrix(x[,5:(4+p)],nrow=nrow(x), ncol=p)%*%beta.e
+    temp.half=chol(beta.esq)%*%t(matrix(x[,5:(4+p)],nrow=nrow(x), ncol=p))
+    z.betasqr.z=t(matrix(rep(1,p),nrow=1)%*%(temp.half*temp.half))
+ 
+    ELBO.new=0
+  
+    ELBO.new= ELBO.new +sum(lgamma(y.1+r.e))- I*lgamma(r.e)- (sum(y.1)+ I*r.e)*log(2)+ sum(((y.1-r.e)/2)*temp2)- 0.5*sum(w.e1*(temp1+temp2^2-temp3))+ sum((x[,4]-0.5)*(xi.e*phi.e1.temp+beta.z))- 0.5*sum( xi.esq*v.ce[,5]*phi.esq1.temp+ 2*xi.e*phi.e1.temp*beta.z*v.ce[,5]+ v.ce[,5]*z.betasqr.z)
+  
+    ELBO.new = ELBO.new + sum((w.c1^2)/2*w.e1) - sum((y.1+r.e)*log(cosh(w.c1/2))) + sum(lgamma(const*(y.1+r.old))) - sum(lgamma(const*(y.1+r.e))) + sum((r.e-r.old)*const*digamma(y.1+r.old))
+    
+    ELBO.new= ELBO.new+ sum(v.ce[,4]*v.ce[,4]*v.ce[,5])/2- sum(log(cosh(v.ce[,4]/2)))
+  
+    ELBO.new= ELBO.new- sum(tau.phi.e*phi.esq1)/2+ tau.phi.e*sum(phi.e1*temp2)- tau.phi.e*sum((temp1+temp2^2-temp3))/2 +0.5*sum(log(phi.prec1))
+  
+    ELBO.new= ELBO.new+ 0.5*(I1+I2+I3)*sum(digamma(s.a)-log(s.b))- (1/2)*(sum(a.esq1%*%s.e)+sum(a.esq2%*%s.e)+sum(a.esq3%*%s.e))- 0.5*(sum(log(a.prec1))+sum(log(a.prec2))+sum(log(a.prec3)))+ 0.5*(sum(a.prec1*(a.esq1-a.e1*a.e1))+ sum(a.prec2*(a.esq2-a.e2*a.e2))+ sum(a.prec3*(a.esq3-a.e3*a.e3)))+ (sum(pnorm(-a.mu1*sqrt(a.prec1), lower=F, log.p=T))+ sum(pnorm(-a.mu2*sqrt(a.prec2), lower=F, log.p=T))+ sum(pnorm(-a.mu3*sqrt(a.prec3), lower=F, log.p=T)))
+  
+    ELBO.new= ELBO.new+ sum((eps1-s.a)*(digamma(s.a)-log(s.b)))- eps2*sum(s.e)- sum(s.a*log(s.b))+ sum(lgamma(s.a))+sum(s.b*s.e)
+  
+    ELBO.new= ELBO.new- tau.xi*xi.esq- 0.5*log(xi.prec)- 0.5*sum(diag(omega.beta*beta.esq))- 0.5*log(det(beta.prec))
+  
+    ELBO.new= ELBO.new+ (tau.phi.eps-tau.phi.a)*(digamma(tau.phi.a)-log(tau.phi.b))- tau.phi.eps*tau.phi.e- tau.phi.a*log(tau.phi.b)+ lgamma(tau.phi.a)+ tau.phi.b*tau.phi.e
+  
+    ELBO=c(ELBO,ELBO.new) 
+  }
+
+  a.e1=a.e1[,apply(a.e1,2,std)>0.0001] #nearly constant vector indicate column to be dropped
+  a.e2=a.e2[,apply(a.e2,2,std)>0.0001]
+  a.e3=a.e3[,apply(a.e3,2,std)>0.0001]
+  result[[runs]]=list(ELBO, s.e, xi.e, xi.esq, beta.e, beta.esq, a.e1, a.e2, a.e3, r.e)
+}
+test2=rep(0,20)
+for(i in 1:20){
+  test2[i]=result[[i]][[1]][1000]
+}
+m=which.max(test2)
+output=result[[m]]
+temp.7=output[[7]]
+temp.8=output[[8]]
+temp.9=output[[9]]
+t1=temp.9[,1]/sum(temp.9[,1])
+t2=temp.9[,2]/sum(temp.9[,2])
+t3=temp.9[,3]/sum(temp.9[,3])
+n1=which.max(c(t1[18],t2[18],t3[18]))
+n3=which.max(c(t1[1],t2[1],t3[1]))
+`%ni%` <- Negate(`%in%`)
+n2=which(c(1,2,3) %ni% c(n1,n3))
+output[[7]]=cbind(temp.7[,n1],temp.7[,n2],temp.7[,n3])
+output[[8]]=cbind(temp.8[,n1],temp.8[,n2],temp.8[,n3])
+output[[9]]=cbind(temp.9[,n1],temp.9[,n2],temp.9[,n3])
+plot(output[[1]][101:1000], type="l") # plot the ELBO of the best run to check convergence
+save(output, rawdata, data, file=paste0("result_",year,".Rdata"))
+
+
+```
+
+
+
+

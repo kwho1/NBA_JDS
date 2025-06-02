@@ -1,0 +1,107 @@
+#Python code to download NBA shotchart data
+#Below is for the regular season 2015-16 as an example
+
+from nba_api.stats.endpoints import shotchartdetail
+import json
+import pandas as pd
+
+response = shotchartdetail.ShotChartDetail(
+    team_id=0,
+    player_id=0,
+    context_measure_simple = 'FGA', 
+    season_nullable='2015-16',
+    season_type_all_star='Regular Season'
+)
+
+content = json.loads(response.get_json())
+
+results = content['resultSets'][0]
+headers = results['headers']
+rows = results['rowSet']
+df = pd.DataFrame(rows)
+df.columns = headers
+
+# write to csv file
+df.to_csv('D:\\nba_2015_16.csv', index=False)
+
+
+
+```{r}
+## Input the year you want to work on, this is the only input needed.
+year = "2015-16"
+```
+
+```{r}
+library(rTensor)
+library(einsum)
+library(stats)
+library(qlcMatrix)
+library(pracma)
+library(arm)
+library(CHNOSZ)
+library(parallel)
+library(dTBM)
+library(torch)
+library(Matrix)
+library(dplyr)
+library(openxlsx)
+
+options(warn=-1)
+
+## read in shot chart data as rawdata
+rawdata=read.csv(paste0("nba_",year,".csv"), sep=",", header=T)
+
+## only retain players having at least 400 shots and only shots in regular quarters and store as data
+mytable = table(rawdata$PLAYER_ID, rawdata$SHOT_ATTEMPTED_FLAG) # count the number of attempts by players
+player.set=as.numeric(row.names(as.data.frame(mytable[mytable>399,])))
+data=rawdata[rawdata$PLAYER_ID %in% player.set,]  
+data=data[data$PERIOD< 5,] # only consider regular quarters
+
+## divide and label the front court into 18 zones and store in data
+temploc=count(rawdata, SHOT_ZONE_AREA, SHOT_ZONE_RANGE, SHOT_ZONE_BASIC, SHOT_ATTEMPTED_FLAG)
+temploc=temploc[temploc$SHOT_ZONE_AREA !="Back Court(BC)",]
+temploc$zone=c(5,6,3,4,2,1,7,8,11,12,9,10,13,14,17,18,15,16)
+data <- (merge(data, temploc, by = c('SHOT_ZONE_BASIC', 'SHOT_ZONE_AREA', 'SHOT_ZONE_RANGE')))
+
+## create three variables
+data$z1=data$MINUTES_REMAINING+data$SECONDS_REMAINING/60 # create time remaining variable
+data$z2=data$SHOT_DISTANCE # create shot distance varaible
+tnames=sort(unique(data$TEAM_NAME))
+tcodes=c("ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DAL", "DEN", "DET", "GSW", "HOU", "IND", "LAC", "LAL", "MEM", "MIA", "MIL", "MIN", "NOP", "NYK", "OKC", "ORL", "PHI", "PHX", "POR", "SAC", "SAS", "TOR", "UTA", "WAS")
+tname.code=cbind(tnames,tcodes)
+colnames(tname.code)=c("TEAM_NAME", "TEAM_CODE")
+data=merge(data,tname.code, by=c("TEAM_NAME"))
+data$z3=ifelse(data$TEAM_CODE==data$HTM,1,0) ## create home team dummy
+
+## create data1 to prepare for mytensor.Y and data.shot as input to main algorithm
+data1=data.frame(data$PLAYER_ID, data$PERIOD, data$zone, data$SHOT_MADE_FLAG, data$z1, data$z2, data$z3, data$PLAYER_NAME)
+
+## create mytensor.Y as the 3-mode tensor counts for the model
+mytensor.Y=array(rep(0, (length(player.set)*4*18)),dim=c(length(player.set),4,18)) # attempts
+data1=cbind(data1,rep(0,nrow(data1)))
+for(i in 1:nrow(data1)){
+  dim1=which(player.set==data1[i,1])
+  dim2=data1[i,2]
+  dim3=data1[i,3]
+  data1[i,9]=dim1
+  mytensor.Y[dim1,dim2,dim3]=mytensor.Y[dim1,dim2,dim3]+1
+}
+
+## create data.shot to store the responses and covariate values per shot for the logistic regression
+ones=rep(1,nrow(data1))
+data.shot=cbind(data1$`rep(0, nrow(data1))`, data1$data.PERIOD, data1$data.zone,  data1$data.SHOT_MADE_FLAG, data1$data.z1, data1$data.z2, data1$data.z3, ones)
+colnames(data.shot)=c("dim1","dim2","dim3","made","min_left","distance","Home", "intercept")
+data.shot=data.shot[order(data.shot[,1],data.shot[,3],data.shot[,2]),]
+
+```
+
+
+
+
+
+
+
+
+
+
+
